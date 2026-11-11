@@ -148,7 +148,7 @@ def generate_token(key_path, namespace):
     except FileNotFoundError:
         sys.exit("error: ssh-keygen not found on PATH")
     except subprocess.CalledProcessError as e:
-        sys.exit(f"error: ssh-keygen sign failed: {e.stderr.decode().strip()}")
+        raise SignError(f"ssh-keygen sign failed: {e.stderr.decode().strip()}")
 
     # Strip the PEM armor (-----BEGIN/END SSH SIGNATURE-----) and decode.
     lines = [ln for ln in armored.splitlines() if ln and not ln.startswith("-----")]
@@ -158,6 +158,10 @@ def generate_token(key_path, namespace):
 
 
 class WSError(Exception):
+    pass
+
+
+class SignError(Exception):
     pass
 
 
@@ -703,6 +707,18 @@ def suspend(stdin_fd, old_termios):
         tty.setraw(stdin_fd, termios.TCSADRAIN)
 
 
+def wait_for_retry(stdin_fd):
+    """Block until the user presses r (retry, returns True) or Ctrl-C (quit,
+    returns False). The terminal is raw, so Ctrl-C arrives as a byte."""
+    banner("signing failed \u2014 press r to retry, Ctrl-C to quit", color=YELLOW)
+    while True:
+        b = os.read(stdin_fd, 1)
+        if b in (b"r", b"R"):
+            return True
+        if b in (b"\x03", b""):
+            return False
+
+
 def handle_server_message(payload):
     try:
         msg = json.loads(payload)
@@ -784,7 +800,7 @@ def main():
     if args.list:
         try:
             names = fetch_sessions()
-        except (OSError, WSError, ssl.SSLError, ValueError) as e:
+        except (OSError, WSError, SignError, ssl.SSLError, ValueError) as e:
             sys.exit(f"error: could not list sessions: {e}")
         if names:
             for n in names:
@@ -805,7 +821,7 @@ def main():
         existing = []
         try:
             existing = fetch_sessions()
-        except (OSError, WSError, ssl.SSLError, ValueError):
+        except (OSError, WSError, SignError, ssl.SSLError, ValueError):
             pass  # best-effort; fall back to a plain random name
         session = random_session_name(avoid=existing)
         log(f"exe-ssh: new session '{session}' (pass a name to reattach; -l to list)")
@@ -838,8 +854,8 @@ def main():
         while True:
             # Re-sign a fresh token per (re)connect so long sessions don't
             # outlive their token's short TTL.
-            headers = auth_headers()
             try:
+                headers = auth_headers()
                 ws = WebSocket.connect(host, args.port, path, headers,
                                        insecure, plaintext=args.plaintext,
                                        connect_host=args.connect_host)
@@ -852,6 +868,14 @@ def main():
                 log(f"exe-ssh: reconnect failed ({e}); retrying in {backoff:.1f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 10)
+                continue
+            except SignError as e:
+                if first:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+                    sys.exit(f"error: {e}")
+                log(f"exe-ssh: {e}")
+                if not wait_for_retry(stdin_fd):
+                    break
                 continue
 
             backoff = 0.5
