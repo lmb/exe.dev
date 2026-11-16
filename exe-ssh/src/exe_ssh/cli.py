@@ -716,7 +716,7 @@ def suspend(stdin_fd, old_termios):
 def wait_for_retry(stdin_fd):
     """Block until the user presses r (retry, returns True) or Ctrl-C (quit,
     returns False). The terminal is raw, so Ctrl-C arrives as a byte."""
-    banner("\u26a0 signing failed \u2014 press r to retry, Ctrl-C to quit",
+    banner("\U0001f511 signing failed \u2014 press r to retry (Ctrl-C to quit)",
            color=YELLOW)
     while True:
         b = os.read(stdin_fd, 1)
