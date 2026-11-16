@@ -148,7 +148,8 @@ def generate_token(key_path, namespace):
     except FileNotFoundError:
         sys.exit("error: ssh-keygen not found on PATH")
     except subprocess.CalledProcessError as e:
-        raise SignError(f"ssh-keygen sign failed: {e.stderr.decode().strip()}")
+        stderr = e.stderr.decode(errors="replace").strip()
+        raise SignError(f"ssh-keygen sign failed: {stderr}", stderr)
 
     # Strip the PEM armor (-----BEGIN/END SSH SIGNATURE-----) and decode.
     lines = [ln for ln in armored.splitlines() if ln and not ln.startswith("-----")]
@@ -162,7 +163,12 @@ class WSError(Exception):
 
 
 class SignError(Exception):
-    pass
+    def __init__(self, msg, stderr=""):
+        super().__init__(msg)
+        # ssh-keygen's last stderr line is the most specific one, e.g.
+        # "Signing (stdin) failed: agent refused operation".
+        lines = stderr.splitlines()
+        self.reason = lines[-1].strip() if lines else ""
 
 
 class WebSocket:
@@ -710,7 +716,8 @@ def suspend(stdin_fd, old_termios):
 def wait_for_retry(stdin_fd):
     """Block until the user presses r (retry, returns True) or Ctrl-C (quit,
     returns False). The terminal is raw, so Ctrl-C arrives as a byte."""
-    banner("signing failed \u2014 press r to retry, Ctrl-C to quit", color=YELLOW)
+    banner("\u26a0 signing failed \u2014 press r to retry, Ctrl-C to quit",
+           color=YELLOW)
     while True:
         b = os.read(stdin_fd, 1)
         if b in (b"r", b"R"):
@@ -873,7 +880,10 @@ def main():
                 if first:
                     termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
                     sys.exit(f"error: {e}")
-                log(f"exe-ssh: {e}")
+                # A refusing agent (e.g. a hardware key wanting a touch) is
+                # expected; only show ssh-keygen's reason for anything else.
+                if e.reason and "agent refused operation" not in e.reason:
+                    log(f"exe-ssh: {e.reason}")
                 if not wait_for_retry(stdin_fd):
                     break
                 continue
