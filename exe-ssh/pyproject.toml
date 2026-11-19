@@ -13,3 +13,4 @@ dependencies = []
 
 [project.scripts]
 exe-ssh = "exe_ssh.cli:main"
+exe-clone = "exe_ssh.cli:clone_main"
