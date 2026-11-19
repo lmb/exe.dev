@@ -5,6 +5,8 @@ Usage:
     exe-ssh <vm> [session-name]   attach (session-name defaults to a random
                                    color name)
     exe-ssh <vm> --list           list existing sessions
+    exe-clone <vm> [--rm]           clone <vm>, attach to the clone, and offer
+                                   to remove it when you exit its shell
 
 The session is persistent and the client auto-reconnects, so dropping the
 network (or closing your laptop) reattaches you to the same shell. A dropped
@@ -79,6 +81,7 @@ def random_session_name(avoid=()):
 
 # ANSI colors for status banners. Suppressed when stderr isn't a tty (e.g.
 # piped or captured), so logs stay plain there.
+RED = "\x1b[31m"
 GREEN = "\x1b[32m"
 YELLOW = "\x1b[33m"
 _RESET = "\x1b[0m"
@@ -145,12 +148,15 @@ def find_key(explicit, host):
              "(ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519, then ssh exe.dev ssh-key add)")
 
 
-def generate_token(key_path, namespace):
+def generate_token(key_path, namespace, cmds=None):
     """Mint a short-lived exe0 API token by SSH-signing a permissions blob.
 
-    See https://exe.dev/docs/https-api-local-key.
+    cmds restricts which exe.dev commands the token may run (for the
+    POST /exec API). See https://exe.dev/docs/https-api-local-key.
     """
     perms = {"exp": int(time.time()) + TOKEN_TTL_SECONDS}
+    if cmds is not None:
+        perms["cmds"] = list(cmds)
     payload = json.dumps(perms, separators=(",", ":")).encode("utf-8")
 
     try:
@@ -437,11 +443,22 @@ class WebSocket:
 
 def http_get_json(host, port, path, headers, insecure, plaintext=False,
                   connect_host=None, timeout=CONNECT_TIMEOUT):
-    """Minimal blocking HTTP/1.1 GET that returns parsed JSON.
+    """Blocking HTTP GET that returns parsed JSON; non-200 raises WSError."""
+    code, body = http_request("GET", host, port, path, headers, insecure,
+                              plaintext=plaintext, connect_host=connect_host,
+                              timeout=timeout)
+    if code != 200:
+        raise WSError(f"HTTP {code}: {body.decode('utf-8', 'replace').strip()}")
+    return json.loads(body.decode("utf-8"))
+
+
+def http_request(method, host, port, path, headers, insecure, body=None,
+                 plaintext=False, connect_host=None, timeout=CONNECT_TIMEOUT):
+    """Minimal blocking HTTP/1.1 request; returns (status code, body bytes).
 
     Shares the WebSocket client's connection conventions (connect_host/SNI/
-    plaintext). Used for the sessions-list endpoint, which is a plain GET
-    rather than a WebSocket upgrade.
+    plaintext). Used for the sessions-list endpoint and the exe.dev /exec
+    API, which are plain requests rather than WebSocket upgrades.
 
     Deliberately tiny: handles Content-Length or Connection: close framing,
     with hard caps on header/body size. It does NOT implement chunked transfer
@@ -472,12 +489,14 @@ def http_get_json(host, port, path, headers, insecure, plaintext=False,
         raw.close()
         raise
     try:
-        req = [f"GET {path} HTTP/1.1", f"Host: {host}", "Connection: close",
+        req = [f"{method} {path} HTTP/1.1", f"Host: {host}", "Connection: close",
                "Accept: application/json"]
+        if body is not None:
+            req.append(f"Content-Length: {len(body)}")
         for k, v in headers.items():
             req.append(f"{k}: {v}")
         req.append("\r\n")
-        sock.sendall("\r\n".join(req).encode("ascii"))
+        sock.sendall("\r\n".join(req).encode("ascii") + (body or b""))
 
         buf = b""
         while b"\r\n\r\n" not in buf:
@@ -487,7 +506,7 @@ def http_get_json(host, port, path, headers, insecure, plaintext=False,
             buf += chunk
             if len(buf) > max_header:
                 raise WSError("response headers too large")
-        head, body = buf.split(b"\r\n\r\n", 1)
+        head, resp = buf.split(b"\r\n\r\n", 1)
         lines = head.decode("latin-1").split("\r\n")
         status = lines[0].split(" ", 2)
         if len(status) < 2 or not status[1].isdigit():
@@ -508,24 +527,22 @@ def http_get_json(host, port, path, headers, insecure, plaintext=False,
 
         # Honor Content-Length when present; otherwise read to EOF (we asked
         # for Connection: close, so the server closes when done).
-        while length is None or len(body) < length:
+        while length is None or len(resp) < length:
             chunk = sock.recv(4096)
             if not chunk:
                 break
-            body += chunk
-            if len(body) > max_body:
+            resp += chunk
+            if len(resp) > max_body:
                 raise WSError("response body too large")
         if length is not None:
-            body = body[:length]
+            resp = resp[:length]
     finally:
         try:
             sock.close()
         except Exception:
             pass
 
-    if code != 200:
-        raise WSError(f"HTTP {code}: {body.decode('utf-8', 'replace').strip()}")
-    return json.loads(body.decode("utf-8"))
+    return code, resp
 
 
 # ---------------------------------------------------------------------------
@@ -600,11 +617,12 @@ class EscapeFilter:
 def run_session(ws, stdin_fd, old_termios):
     """Pump bytes between the local tty (stdin_fd) and the websocket.
 
-    Returns a reason string describing why the session ended:
-      "ended"        -- the remote shell exited (server closed with
-                        CLOSE_SHELL_EXITED, e.g. you hit Ctrl-D / typed exit),
-                        local stdin reached EOF, or the user asked to quit with
-                        the ``~.`` escape. The caller should NOT reconnect.
+    Returns a reason string describing why the session ended. For the first
+    three the caller should NOT reconnect (see ENDED_REASONS):
+      "exited"       -- the remote shell exited (server closed with
+                        CLOSE_SHELL_EXITED, e.g. you hit Ctrl-D / typed exit).
+      "quit"         -- the user asked to quit with the ``~.`` escape.
+      "eof"          -- local stdin reached EOF.
       "disconnected" -- the connection dropped (TCP EOF, an abnormal close, or
                         our keepalive ping went unanswered for too long). The
                         caller should reconnect.
@@ -660,7 +678,7 @@ def run_session(ws, stdin_fd, old_termios):
                         # none means we should recover by reconnecting.
                         code = (payload[0] << 8) | payload[1] if len(payload) >= 2 else None
                         if code == WebSocket.CLOSE_SHELL_EXITED:
-                            return "ended"
+                            return "exited"
                         return "disconnected"
                     if opcode == WebSocket.OP_PING:
                         ws.pong(payload)
@@ -683,7 +701,7 @@ def run_session(ws, stdin_fd, old_termios):
                 except OSError:
                     data = b""
                 if not data:
-                    return "ended"  # local EOF (e.g. Ctrl-D at a closed stdin)
+                    return "eof"  # local EOF (e.g. Ctrl-D at a closed stdin)
                 forward, actions = escapes.feed(data)
                 # Forward typed-through bytes BEFORE acting on any escape, so
                 # e.g. "echo hi\n~." still delivers the line before we quit.
@@ -693,7 +711,7 @@ def run_session(ws, stdin_fd, old_termios):
                 for action in actions:
                     if action == "quit":
                         log("exe-ssh: closed (escape ~.).")
-                        return "ended"
+                        return "quit"
                     elif action == "help":
                         sys.stderr.write(ESCAPE_HELP)
                         sys.stderr.flush()
@@ -749,8 +767,147 @@ def handle_server_message(payload):
         os.write(sys.stdout.fileno(), raw)
 
 
-def main():
+# Ways run_session can end that mean "don't reconnect".
+ENDED_REASONS = ("exited", "quit", "eof")
+
+
+class ConnectError(Exception):
+    """The first connection attempt failed and won't be retried."""
+
+
+def attach(connect, stdin_fd, label=None, boot_timeout=0, kill_note=None):
+    """Run the interactive session, reconnecting whenever the link drops.
+
+    connect() opens a fresh WebSocket (re-signing its token each time). The
+    first connect is retried for up to boot_timeout seconds (e.g. while a new
+    VM boots), after which it raises ConnectError. label names the VM in
+    status banners; kill_note is logged if SIGTERM/SIGHUP kills us.
+
+    Returns why the session ended: one of ENDED_REASONS, "interrupted"
+    (Ctrl-C/SIGINT), or "gave-up" (the user quit at the signing prompt).
+    """
+    old_termios = termios.tcgetattr(stdin_fd)
+
+    def restore_and_exit(signum, frame):
+        # Restore the local terminal before dying on SIGTERM/SIGHUP so we
+        # don't leave the user's shell stuck in raw mode.
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+        sys.stderr.write("\r\n")
+        if kill_note:
+            log(kill_note)
+        os._exit(143)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, restore_and_exit)
+
+    deadline = time.monotonic() + boot_timeout
+    backoff = 0.5
+    first = True
+    try:
+        while True:
+            try:
+                ws = connect()
+            except (OSError, WSError, ssl.SSLError) as e:
+                if first:
+                    if time.monotonic() >= deadline:
+                        raise ConnectError(f"connect failed: {e}")
+                    # Still in cooked mode, so Ctrl-C interrupts this wait.
+                    banner(f"waiting for {label} to come up… (Ctrl-C to quit)",
+                           color=YELLOW, replace=True)
+                    time.sleep(1)
+                    continue
+                log(f"exe-ssh: reconnect failed ({e}); retrying in {backoff:.1f}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+            except SignError as e:
+                if first:
+                    raise ConnectError(str(e))
+                # A refusing agent (e.g. a hardware key wanting a touch) is
+                # expected; only show ssh-keygen's reason for anything else.
+                if e.reason and "agent refused operation" not in e.reason:
+                    log(f"exe-ssh: {e.reason}")
+                if not wait_for_retry(stdin_fd):
+                    return "gave-up"
+                continue
+
+            backoff = 0.5
+            if first:
+                # Raw mode only once connected, so the first connect (and any
+                # boot wait) can still be interrupted with Ctrl-C.
+                tty.setraw(stdin_fd)
+            else:
+                banner("✓ reconnected", color=GREEN)
+            first = False
+            reason = "disconnected"
+            try:
+                reason = run_session(ws, stdin_fd, old_termios)
+            except (OSError, WSError, ssl.SSLError) as e:
+                # Mid-session network failure: fall through to reconnect
+                # rather than dumping a traceback. This is the common case
+                # the auto-reconnect feature exists for.
+                log(f"exe-ssh: connection lost ({e})")
+            finally:
+                ws.close()
+
+            if reason in ENDED_REASONS:
+                # The remote shell exited (Ctrl-D / logout) or the user asked
+                # to quit (~.). Reconnecting would just spawn a fresh shell, so
+                # quit instead -- this matches what ssh(1) does.
+                log("exe-ssh: session ended.")
+                return reason
+
+            to = f" to {label}" if label else ""
+            banner(f"⚡ connection lost{to} — reconnecting… (Ctrl-C to quit)",
+                   color=YELLOW)
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        return "interrupted"
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+        sys.stderr.write("\r\n")
+
+
+def parse_vm(arg):
+    """Split a VM argument into (name, base): a bare name like willow-wind
+    means the default exe.xyz base; willow-wind.example.com names it."""
+    name, _, base = arg.partition(".")
+    base = base or "exe.xyz"
+    # Validate before interpolating into HTTP headers and namespaces, so they
+    # can't smuggle CRLF or other junk.
+    for label, val in (("vm", name), ("host", base)):
+        if not val or any(c in val for c in "\r\n /\\:@?#") or val != val.strip():
+            sys.exit(f"error: invalid {label}: {val!r}")
+    return name, base
+
+
+def add_hidden_test_args(parser):
+    # Hidden knobs for testing against a local non-TLS stack on a random port.
+    # Not for production use; deliberately undocumented.
+    parser.add_argument("--port", type=int, default=443, help=argparse.SUPPRESS)
+    parser.add_argument("--plaintext", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--connect-host", default=None, help=argparse.SUPPRESS)
+
+
+def terminal_connector(args, host, key_path, session):
+    """Return a connect() for attach() that opens the terminal WebSocket for
+    `session` on `host`, signing a fresh token each time."""
+    namespace = f"v0@{host}"
+    path = f"/terminal/ws/experimental-exe-ssh?{urlencode({'name': session})}"
+    insecure = os.environ.get("EXE_SSH_INSECURE") == "1"
+
+    def connect():
+        headers = {"Authorization": f"Bearer {generate_token(key_path, namespace)}"}
+        return WebSocket.connect(host, args.port, path, headers, insecure,
+                                 plaintext=args.plaintext,
+                                 connect_host=args.connect_host)
+    return connect
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
+        prog="exe-ssh",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="An SSH-ish interactive terminal for an exe.dev VM, over "
                     "HTTPS (no port 22). The session is persistent and the "
@@ -771,23 +928,12 @@ def main():
     parser.add_argument("-i", "--key", metavar="PATH", default=None,
                         help="SSH private key to sign with "
                              "(default: ask ssh -G)")
-    # Hidden knobs for testing against a local non-TLS stack on a random port.
-    # Not for production use; deliberately undocumented.
-    parser.add_argument("--port", type=int, default=443, help=argparse.SUPPRESS)
-    parser.add_argument("--plaintext", action="store_true",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--connect-host", default=None, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    add_hidden_test_args(parser)
+    args = parser.parse_args(argv)
 
     # The VM arg is either a bare name (-> <name>.xterm.exe.xyz) or a
     # fully-qualified box host like <name>.exe.xyz (-> <name>.xterm.exe.xyz).
-    name, _, base = args.vm.partition(".")
-    base = base or "exe.xyz"
-    # Validate before interpolating into HTTP headers and namespaces, so they
-    # can't smuggle CRLF or other junk.
-    for label, val in (("vm", name), ("host", base)):
-        if not val or any(c in val for c in "\r\n /\\:@?#") or val != val.strip():
-            sys.exit(f"error: invalid {label}: {val!r}")
+    name, base = parse_vm(args.vm)
 
     # The terminal endpoint is scoped to its own namespace (v0@<vm>.xterm.<base>),
     # distinct from the general VM-proxy namespace (v0@<vm>.<base>): the token
@@ -797,12 +943,9 @@ def main():
     key_path = find_key(args.key, host)
     insecure = os.environ.get("EXE_SSH_INSECURE") == "1"
 
-    def auth_headers():
-        # Re-sign a fresh short-TTL token per request/connect.
-        return {"Authorization": f"Bearer {generate_token(key_path, namespace)}"}
-
     def fetch_sessions():
-        resp = http_get_json(host, args.port, "/terminal/sessions", auth_headers(),
+        headers = {"Authorization": f"Bearer {generate_token(key_path, namespace)}"}
+        resp = http_get_json(host, args.port, "/terminal/sessions", headers,
                              insecure, plaintext=args.plaintext,
                              connect_host=args.connect_host)
         sessions = resp.get("sessions") if isinstance(resp, dict) else None
@@ -849,88 +992,162 @@ def main():
         sys.exit(f"error: invalid session name: {session!r} "
                  "(letters, digits and dashes only)")
 
-    qs = urlencode({"name": session})
-    path = f"/terminal/ws/experimental-exe-ssh?{qs}"
-
     log(f"exe-ssh: connecting to {args.vm} (session '{session}') over https...")
-
-    stdin_fd = sys.stdin.fileno()
-    old_termios = termios.tcgetattr(stdin_fd)
-
-    def restore_and_exit(signum, frame):
-        # Restore the local terminal before dying on SIGTERM/SIGHUP so we
-        # don't leave the user's shell stuck in raw mode.
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
-        sys.stderr.write("\r\n")
-        os._exit(143)
-
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, restore_and_exit)
-
-    backoff = 0.5
-    first = True
+    connect = terminal_connector(args, host, key_path, session)
     try:
-        tty.setraw(stdin_fd)
-        while True:
-            # Re-sign a fresh token per (re)connect so long sessions don't
-            # outlive their token's short TTL.
-            try:
-                headers = auth_headers()
-                ws = WebSocket.connect(host, args.port, path, headers,
-                                       insecure, plaintext=args.plaintext,
-                                       connect_host=args.connect_host)
-            except (OSError, WSError, ssl.SSLError) as e:
-                if first:
-                    # Restore the terminal before reporting a hard failure so
-                    # the message isn't mangled by raw mode.
-                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
-                    sys.exit(f"error: connect failed: {e}")
-                log(f"exe-ssh: reconnect failed ({e}); retrying in {backoff:.1f}s")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 10)
-                continue
-            except SignError as e:
-                if first:
-                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
-                    sys.exit(f"error: {e}")
-                # A refusing agent (e.g. a hardware key wanting a touch) is
-                # expected; only show ssh-keygen's reason for anything else.
-                if e.reason and "agent refused operation" not in e.reason:
-                    log(f"exe-ssh: {e.reason}")
-                if not wait_for_retry(stdin_fd):
-                    break
-                continue
+        attach(connect, sys.stdin.fileno())
+    except ConnectError as e:
+        sys.exit(f"error: {e}")
 
-            backoff = 0.5
-            if not first:
-                banner("\u2713 reconnected", color=GREEN)
-            first = False
-            reason = "disconnected"
-            try:
-                reason = run_session(ws, stdin_fd, old_termios)
-            except (OSError, WSError, ssl.SSLError) as e:
-                # Mid-session network failure: fall through to reconnect
-                # rather than dumping a traceback. This is the common case
-                # the auto-reconnect feature exists for.
-                log(f"exe-ssh: connection lost ({e})")
-            finally:
-                ws.close()
 
-            if reason == "ended":
-                # The remote shell exited (Ctrl-D / logout) or the user asked
-                # to quit (~.). Reconnecting would just spawn a fresh shell, so
-                # quit instead -- this matches what ssh(1) does.
-                log("exe-ssh: session ended.")
-                break
+# ---------------------------------------------------------------------------
+# exe-clone: ephemeral clones
+# ---------------------------------------------------------------------------
 
-            banner("\u26a1 connection lost \u2014 reconnecting\u2026 (Ctrl-C to quit)",
-                   color=YELLOW)
-            time.sleep(0.3)
+# How long to keep retrying the first connect while a fresh clone boots.
+CLONE_BOOT_TIMEOUT = 90
+# Copying a VM can take a while; give the cp request more than the default.
+CLONE_REQUEST_TIMEOUT = 300
+CLONE_SUFFIX_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+class APIError(Exception):
+    pass
+
+
+def clone_name(src):
+    """Name the clone after its source plus a random suffix, so it's
+    recognisable (e.g. in `ssh exe.dev ls`) if it has to be removed by hand."""
+    return f"{src}-" + "".join(random.choice(CLONE_SUFFIX_CHARS) for _ in range(4))
+
+
+def parse_clone_response(body, fallback):
+    """The VM name from a `cp` API response, or fallback if it has none."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return fallback
+    if isinstance(data, dict):
+        for key in ("vm_name", "name", "vm"):
+            val = data.get(key)
+            if isinstance(val, str) and re.fullmatch(r"[a-zA-Z0-9-]+", val):
+                return val
+    return fallback
+
+
+def confirm(prompt, default=False):
+    """Ask a yes/no question on the (cooked-mode) terminal. Enter picks
+    default; Ctrl-C and EOF always mean no."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        line = sys.stdin.readline()
     except KeyboardInterrupt:
-        pass
-    finally:
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
-        sys.stderr.write("\r\n")
+        line = ""
+    if not line:
+        sys.stderr.write("\n")
+        return False
+    answer = line.strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def clone_main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="exe-clone",
+        description="Clone an exe.dev VM, open a terminal on the clone, and "
+                    "offer to remove the clone when you exit its shell. The "
+                    "connection auto-reconnects like exe-ssh.")
+    parser.add_argument("vm", help="VM to clone (e.g. willow-wind)")
+    parser.add_argument("--rm", action="store_true",
+                        help="remove the clone without asking when you exit "
+                             "its shell")
+    parser.add_argument("-i", "--key", metavar="PATH", default=None,
+                        help="SSH private key to sign with "
+                             "(default: ask ssh -G)")
+    add_hidden_test_args(parser)
+    parser.add_argument("--api-host", default="exe.dev", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    src, base = parse_vm(args.vm)
+    if not sys.stdin.isatty():
+        sys.exit("error: stdin is not a tty; this client needs an interactive terminal")
+
+    clone = clone_name(src)
+    host = f"{clone}.xterm.{base}"
+    key_path = find_key(args.key, host)
+    insecure = os.environ.get("EXE_SSH_INSECURE") == "1"
+    cleanup = f"ssh {args.api_host} rm {clone}"
+
+    def api(cmd, timeout=CONNECT_TIMEOUT):
+        """Run an exe.dev command via POST /exec with a token that may run
+        only that command. A failed signature offers a retry."""
+        while True:
+            try:
+                token = generate_token(key_path, f"v0@{args.api_host}",
+                                       cmds=[cmd.split()[0]])
+                break
+            except SignError as e:
+                log(f"exe-ssh: {e.reason or e}")
+                if not confirm("exe-ssh: signing failed — retry? [Y/n] ", default=True):
+                    raise
+        headers = {"Authorization": f"Bearer {token}",
+                   "Content-Type": "text/plain"}
+        code, body = http_request("POST", args.api_host, args.port, "/exec",
+                                  headers, insecure, body=cmd.encode("utf-8"),
+                                  plaintext=args.plaintext,
+                                  connect_host=args.connect_host, timeout=timeout)
+        if code != 200:
+            raise APIError(f"HTTP {code}: {body.decode('utf-8', 'replace').strip()}")
+        return body
+
+    log(f"exe-ssh: cloning {src} → {clone}…")
+    try:
+        body = api(f"cp {src} {clone}", timeout=CLONE_REQUEST_TIMEOUT)
+    except (OSError, WSError, APIError, SignError, ssl.SSLError,
+            KeyboardInterrupt) as e:
+        log(f"exe-ssh: if {clone} was created anyway, remove it with: {cleanup}")
+        sys.exit(f"error: could not clone {src}: {e or 'interrupted'}")
+    if parse_clone_response(body, clone) != clone:
+        # Unexpected, but don't connect to (or offer to remove) a VM whose
+        # name we can't trust.
+        sys.exit(f"error: server created a clone with an unexpected name; "
+                 f"check `ssh {args.api_host} ls`")
+
+    # Print the manual cleanup now, so it's on screen whatever happens later.
+    log(f"exe-ssh: created clone {clone}; to remove it yourself: {cleanup}")
+    log(f"exe-ssh: connecting to clone {clone} (from {src}) over https...")
+    connect = terminal_connector(args, host, key_path, random_session_name())
+    try:
+        reason = attach(connect, sys.stdin.fileno(), label=f"clone {clone}",
+                        boot_timeout=CLONE_BOOT_TIMEOUT,
+                        kill_note=f"exe-ssh: kept clone {clone}; remove it with: {cleanup}")
+    except ConnectError as e:
+        # The clone never became usable, so there's nothing on it to lose:
+        # treat this like a deliberate exit and offer to remove it.
+        log(f"exe-ssh: {e}")
+        reason = "failed"
+
+    if reason not in ("exited", "quit", "failed"):
+        # Interrupted, gave up signing, or stdin EOF: not a deliberate exit
+        # from the shell, so never remove anything.
+        log(f"exe-ssh: kept clone {clone}; remove it with: {cleanup}")
+        return
+
+    if not (args.rm or confirm(f"exe-ssh: remove clone {clone}? [y/N] ")):
+        log(f"exe-ssh: kept clone {clone}; remove it with: {cleanup}")
+        return
+
+    log(f"exe-ssh: removing {clone}…")
+    try:
+        api(f"rm {clone}", timeout=CLONE_REQUEST_TIMEOUT)
+    except (OSError, WSError, APIError, SignError, ssl.SSLError,
+            KeyboardInterrupt) as e:
+        banner(f"could not remove clone {clone}: {e or 'interrupted'}", color=RED)
+        log(f"exe-ssh: remove it yourself with: {cleanup}")
+        sys.exit(1)
+    log(f"exe-ssh: removed {clone}.")
 
 
 if __name__ == "__main__":
