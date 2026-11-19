@@ -84,20 +84,33 @@ YELLOW = "\x1b[33m"
 _RESET = "\x1b[0m"
 
 
+# Whether the last line written to stderr was a banner, so the next banner
+# can overwrite it instead of stacking status lines.
+_banner_shown = False
+
+
 def log(msg):
+    global _banner_shown
+    _banner_shown = False
     sys.stderr.write("\r\x1b[2K" + msg + "\r\n")
     sys.stderr.flush()
 
 
-def banner(msg, color=""):
+def banner(msg, color="", replace=False):
     """A status line that stands out from shell output: bold, reverse-video,
     and color when stderr is a terminal. Used for reconnection state so the
-    user can plainly see the link dropped and came back."""
-    if color and sys.stderr.isatty():
+    user can plainly see the link dropped and came back. With replace, it
+    overwrites the previous line if that was also a banner."""
+    global _banner_shown
+    tty = sys.stderr.isatty()
+    if color and tty:
         msg = f"{color}\x1b[1m\x1b[7m exe-ssh: {msg} {_RESET}"
     else:
         msg = f"exe-ssh: {msg}"
+    if replace and _banner_shown and tty:
+        sys.stderr.write("\x1b[1A")  # cursor up onto the previous banner
     log(msg)
+    _banner_shown = True
 
 
 def b64url(data: bytes) -> str:
@@ -717,7 +730,7 @@ def wait_for_retry(stdin_fd):
     """Block until the user presses r (retry, returns True) or Ctrl-C (quit,
     returns False). The terminal is raw, so Ctrl-C arrives as a byte."""
     banner("\U0001f511 signing failed \u2014 press r to retry (Ctrl-C to quit)",
-           color=YELLOW)
+           color=YELLOW, replace=True)
     while True:
         b = os.read(stdin_fd, 1)
         if b in (b"r", b"R"):
