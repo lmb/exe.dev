@@ -84,20 +84,33 @@ YELLOW = "\x1b[33m"
 _RESET = "\x1b[0m"
 
 
+# Whether the last line written to stderr was a banner, so the next banner
+# can overwrite it instead of stacking status lines.
+_banner_shown = False
+
+
 def log(msg):
+    global _banner_shown
+    _banner_shown = False
     sys.stderr.write("\r\x1b[2K" + msg + "\r\n")
     sys.stderr.flush()
 
 
-def banner(msg, color=""):
+def banner(msg, color="", replace=False):
     """A status line that stands out from shell output: bold, reverse-video,
     and color when stderr is a terminal. Used for reconnection state so the
-    user can plainly see the link dropped and came back."""
-    if color and sys.stderr.isatty():
+    user can plainly see the link dropped and came back. With replace, it
+    overwrites the previous line if that was also a banner."""
+    global _banner_shown
+    tty = sys.stderr.isatty()
+    if color and tty:
         msg = f"{color}\x1b[1m\x1b[7m exe-ssh: {msg} {_RESET}"
     else:
         msg = f"exe-ssh: {msg}"
+    if replace and _banner_shown and tty:
+        sys.stderr.write("\x1b[1A")  # cursor up onto the previous banner
     log(msg)
+    _banner_shown = True
 
 
 def b64url(data: bytes) -> str:
@@ -148,7 +161,8 @@ def generate_token(key_path, namespace):
     except FileNotFoundError:
         sys.exit("error: ssh-keygen not found on PATH")
     except subprocess.CalledProcessError as e:
-        sys.exit(f"error: ssh-keygen sign failed: {e.stderr.decode().strip()}")
+        stderr = e.stderr.decode(errors="replace").strip()
+        raise SignError(f"ssh-keygen sign failed: {stderr}", stderr)
 
     # Strip the PEM armor (-----BEGIN/END SSH SIGNATURE-----) and decode.
     lines = [ln for ln in armored.splitlines() if ln and not ln.startswith("-----")]
@@ -159,6 +173,15 @@ def generate_token(key_path, namespace):
 
 class WSError(Exception):
     pass
+
+
+class SignError(Exception):
+    def __init__(self, msg, stderr=""):
+        super().__init__(msg)
+        # ssh-keygen's last stderr line is the most specific one, e.g.
+        # "Signing (stdin) failed: agent refused operation".
+        lines = stderr.splitlines()
+        self.reason = lines[-1].strip() if lines else ""
 
 
 class WebSocket:
@@ -703,6 +726,19 @@ def suspend(stdin_fd, old_termios):
         tty.setraw(stdin_fd, termios.TCSADRAIN)
 
 
+def wait_for_retry(stdin_fd):
+    """Block until the user presses r (retry, returns True) or Ctrl-C (quit,
+    returns False). The terminal is raw, so Ctrl-C arrives as a byte."""
+    banner("\U0001f511 signing failed \u2014 press r to retry (Ctrl-C to quit)",
+           color=YELLOW, replace=True)
+    while True:
+        b = os.read(stdin_fd, 1)
+        if b in (b"r", b"R"):
+            return True
+        if b in (b"\x03", b""):
+            return False
+
+
 def handle_server_message(payload):
     try:
         msg = json.loads(payload)
@@ -784,7 +820,7 @@ def main():
     if args.list:
         try:
             names = fetch_sessions()
-        except (OSError, WSError, ssl.SSLError, ValueError) as e:
+        except (OSError, WSError, SignError, ssl.SSLError, ValueError) as e:
             sys.exit(f"error: could not list sessions: {e}")
         if names:
             for n in names:
@@ -805,7 +841,7 @@ def main():
         existing = []
         try:
             existing = fetch_sessions()
-        except (OSError, WSError, ssl.SSLError, ValueError):
+        except (OSError, WSError, SignError, ssl.SSLError, ValueError):
             pass  # best-effort; fall back to a plain random name
         session = random_session_name(avoid=existing)
         log(f"exe-ssh: new session '{session}' (pass a name to reattach; -l to list)")
@@ -838,8 +874,8 @@ def main():
         while True:
             # Re-sign a fresh token per (re)connect so long sessions don't
             # outlive their token's short TTL.
-            headers = auth_headers()
             try:
+                headers = auth_headers()
                 ws = WebSocket.connect(host, args.port, path, headers,
                                        insecure, plaintext=args.plaintext,
                                        connect_host=args.connect_host)
@@ -852,6 +888,17 @@ def main():
                 log(f"exe-ssh: reconnect failed ({e}); retrying in {backoff:.1f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 10)
+                continue
+            except SignError as e:
+                if first:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+                    sys.exit(f"error: {e}")
+                # A refusing agent (e.g. a hardware key wanting a touch) is
+                # expected; only show ssh-keygen's reason for anything else.
+                if e.reason and "agent refused operation" not in e.reason:
+                    log(f"exe-ssh: {e.reason}")
+                if not wait_for_retry(stdin_fd):
+                    break
                 continue
 
             backoff = 0.5
